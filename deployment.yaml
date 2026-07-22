@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-reconciler
+  namespace: agent-reconciler
+spec:
+  replicas: 1            # v0 uses an in-memory miss counter — do NOT scale past 1
+  selector:
+    matchLabels: {app: agent-reconciler}
+  template:
+    metadata:
+      labels: {app: agent-reconciler}
+    spec:
+      serviceAccountName: agent-reconciler
+      containers:
+        - name: agent-reconciler
+          image: REGISTRY/agent-reconciler:v0   # <- set your image
+          env:
+            - name: VM_ID_LABEL
+              value: "infra.example.com/vm-id"   # <- set to YOUR real join key
+            - name: INVENTORY_NAME_FILTER
+              value: "virtual-machine"          # only manage inventories whose name contains this
+            - name: INFRAENV_LABEL
+              value: "infraenvs.agent-install.openshift.io"
+            - name: KUBEVIRT_KUBECONFIG
+              value: "/etc/kubevirt/kubeconfig"
+            - name: MISS_THRESHOLD
+              value: "3"
+            - name: MAX_SKEW
+              value: "1"
+          ports:
+            - {name: metrics, containerPort: 8080}
+            - {name: health, containerPort: 8081}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8081}
+            initialDelaySeconds: 10
+          volumeMounts:
+            - name: kubevirt-kubeconfig
+              mountPath: /etc/kubevirt
+              readOnly: true
+      volumes:
+        - name: kubevirt-kubeconfig
+          secret:
+            secretName: kubevirt-kubeconfig   # kubeconfig for the KubeVirt cluster
