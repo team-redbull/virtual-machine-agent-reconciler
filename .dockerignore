@@ -1,0 +1,4 @@
+charts/
+tests/
+__pycache__/
+*.pyc
