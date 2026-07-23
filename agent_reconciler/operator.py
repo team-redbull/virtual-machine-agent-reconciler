@@ -38,6 +38,12 @@ async def startup(settings: kopf.OperatorSettings, **_):
     settings.posting.level = logging.WARNING
     _state["mgmt"] = clients.mgmt_api()
     _state["kv"] = clients.kubevirt_api(config.KUBEVIRT_KUBECONFIG)
+
+    # Fail loudly on the classic "system:anonymous" setup, instead of letting
+    # Kopf retry a forbidden /apis call nine times with an opaque error.
+    clients.assert_authenticated(_state["mgmt"], "management")
+    clients.assert_authenticated(_state["kv"], "kubevirt")
+
     start_http_server(config.METRICS_PORT)
     log.warning(
         "agent-reconciler v0 started (LOG ONLY — no writes). vm-id label=%s, "

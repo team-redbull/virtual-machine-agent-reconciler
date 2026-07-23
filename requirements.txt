@@ -1,3 +1,8 @@
-kopf>=1.37,<2
-kubernetes>=29.0
+# Pinned deliberately. kubernetes >=36.0.2 moved the bearer token from the
+# api_key key 'authorization' to 'BearerToken'. Older kopf releases only read
+# 'authorization', so they extract an empty token and every request goes out
+# unauthenticated -> the API server reports User "system:anonymous".
+# kopf >=1.38 reads BearerToken first, then falls back. Keep these compatible.
+kopf>=1.38,<2
+kubernetes>=29.0,<37
 prometheus-client>=0.20

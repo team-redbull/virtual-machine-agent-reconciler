@@ -88,6 +88,54 @@ The inventory filter exists for the same reason: hosts in a *physical* inventory
 no VM in KubeVirt, so without the filter they would all read as "confirmed absent"
 and be flagged as orphans.
 
+## Troubleshooting
+
+Three failure modes hit during first deployment, all fixed in this repo. Kept here
+because each produces a misleading error.
+
+### `ModuleNotFoundError: No module named 'agent_reconciler'`
+
+Installed console scripts (`kopf` lives in `/usr/local/bin`) do **not** put the
+working directory on `sys.path`, so `WORKDIR /app` alone is not enough. Fixed by
+`ENV PYTHONPATH=/app` in the Dockerfile. Verify before pushing:
+
+```bash
+podman run --rm --entrypoint python REGISTRY/agent-reconciler:v0 \
+  -c "import agent_reconciler.operator; print('import OK')"
+```
+
+### `No usable temporary directory found in ['/tmp', ...]`
+
+The chart sets `readOnlyRootFilesystem: true`, which makes `/tmp` read-only too;
+Python needs a writable temp dir at import time. Fixed in the chart by mounting an
+`emptyDir` at `/tmp` — the hardening stays on.
+
+### `forbidden: User "system:anonymous" cannot get path "/apis"`
+
+**Not an RBAC problem, and not the KubeVirt kubeconfig.** kubernetes-client
+>=36.0.2 moved the bearer token from `api_key['authorization']` to
+`api_key['BearerToken']`. Older kopf releases only read the old key, extract an
+empty token, and send every request unauthenticated.
+
+Tell-tale signs: `login_via_client` reports **success** (it builds a valid config
+object, just with `token=None`), and the *first real* call fails as anonymous.
+
+Fixed by the version pins in `requirements.txt`. Confirm what actually got
+installed — a cached layer can silently keep an old kopf:
+
+```bash
+podman build --no-cache -t REGISTRY/agent-reconciler:v0 .
+podman run --rm --entrypoint pip REGISTRY/agent-reconciler:v0 list | grep -Ei 'kopf|kubernetes'
+```
+
+> Note: do **not** debug this with `Configuration().api_key.get('authorization')` —
+> that key is empty by design on kubernetes >=36.0.2 even when auth is healthy.
+> Check `api_key.get('BearerToken')` instead.
+
+Read the *identity* in any authorization error before touching RBAC:
+`system:anonymous` means authentication never happened, so granting permissions
+cannot help. A real RBAC failure names your ServiceAccount.
+
 ## Roadmap
 
 - **v1** cleanup — delete Agent + BMH on confirmed orphan, behind `--dry-run`. Needs
