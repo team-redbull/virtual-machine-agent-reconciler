@@ -17,9 +17,17 @@ KUBEVIRT_VERSION = "v1"
 
 
 def mgmt_api() -> client.CustomObjectsApi:
-    """CRD client for the management (HyperShift/MCE) cluster we run inside."""
-    config.load_incluster_config()
-    return client.CustomObjectsApi()
+    """CRD client for the management (HyperShift/MCE) cluster we run inside.
+
+    Loads into its OWN Configuration rather than the process-wide default singleton.
+    Bare `load_incluster_config()` calls `Configuration.set_default()`, making this
+    client's credentials shared mutable global state that any other library in the
+    process can read or overwrite. Kopf has its own explicit credentials now
+    (see auth.py), so nothing needs the default -- keep it untouched.
+    """
+    cfg = client.Configuration()
+    config.load_incluster_config(client_configuration=cfg)
+    return client.CustomObjectsApi(client.ApiClient(cfg))
 
 
 def kubevirt_api(kubeconfig_path: str) -> client.CustomObjectsApi:
@@ -32,10 +40,15 @@ def kubevirt_api(kubeconfig_path: str) -> client.CustomObjectsApi:
 def assert_authenticated(api: client.CustomObjectsApi, which: str) -> None:
     """Make one real call and confirm we are not talking as system:anonymous.
 
-    Catches the failure mode where credentials LOAD fine but are never SENT --
-    e.g. a kopf/kubernetes version pair that disagrees on where the bearer token
-    lives (api_key['authorization'] vs api_key['BearerToken']). Without this the
-    only symptom is an opaque retrying 'forbidden ... /apis' loop.
+    Catches the failure mode where credentials LOAD fine but are never SENT.
+    Without this the only symptom is an opaque retrying 'forbidden ... /apis' loop.
+
+    SCOPE -- read this before trusting it: this only proves the plain `kubernetes`
+    clients built in this module. It does NOT cover Kopf, which maintains its own
+    separate aiohttp session built from the @kopf.on.login() handler. Those two can
+    and did disagree: the version bug in auth.py broke Kopf's connection while these
+    clients kept working, so this assertion passed while the operator was dead.
+    operator.startup() asserts the Kopf side separately.
     """
     try:
         client.VersionApi(api.api_client).get_code()
@@ -43,8 +56,9 @@ def assert_authenticated(api: client.CustomObjectsApi, which: str) -> None:
         if e.status in (401, 403) and "anonymous" in str(e.body or ""):
             raise RuntimeError(
                 f"{which} cluster rejected our credentials as system:anonymous -- the token "
-                f"was loaded but not sent. Check the kopf/kubernetes version pair "
-                f"(see requirements.txt) and that the ServiceAccount token is mounted."
+                f"was loaded but not sent. `system:anonymous` names NO user, so this is a "
+                f"CLIENT problem, not RBAC (an RBAC denial would name the ServiceAccount). "
+                f"Check that the token is mounted and non-empty."
             ) from e
         raise
     log.warning("%s cluster: authenticated OK", which)

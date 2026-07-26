@@ -12,7 +12,7 @@ import logging
 import kopf
 from prometheus_client import Gauge, start_http_server
 
-from . import clients, config, detect
+from . import auth, clients, config, detect
 
 log = logging.getLogger("agent-reconciler")
 
@@ -32,10 +32,68 @@ CLUSTER_SKEW = Gauge(
 )
 
 
+def _assert_kopf_login_is_explicit() -> None:
+    """Fail fast if Kopf would fall back to its built-in login instead of ours.
+
+    This is the guard that was missing when the operator sat in a `system:anonymous`
+    retry loop: clients.assert_authenticated() only ever probed the plain `kubernetes`
+    clients (which were fine), never Kopf's own connection (which was not). If the
+    @kopf.on.login() handler below is ever removed or fails to register, Kopf silently
+    reverts to login_via_client -- so assert that it did not, at startup, loudly.
+
+    Best-effort: Kopf's registry internals are private, so a lookup failure only warns.
+    """
+    try:
+        from kopf._core.intents import causes
+        handlers = kopf.get_default_registry()._activities.get_all_handlers()
+        logins = [h for h in handlers
+                  if h.activity == causes.Activity.AUTHENTICATION]
+        explicit = [h for h in logins if not getattr(h, "_fallback", False)]
+    except Exception as e:  # pragma: no cover - private API moved
+        log.warning("could not introspect kopf login handlers (%s) -- skipping check", e)
+        return
+
+    if not explicit:
+        raise RuntimeError(
+            "No explicit @kopf.on.login() handler is registered, so kopf will fall back "
+            "to %s. On kopf<=1.44.5 with kubernetes>=36.0.2 that fallback yields token=None "
+            "and every API call authenticates as system:anonymous. Restore the login() "
+            "handler in agent_reconciler/operator.py." % ([h.id for h in logins] or "nothing")
+        )
+    log.warning("kopf login handler(s) in use: %s", [str(h.id) for h in explicit])
+
+
+@kopf.on.login()
+def login(settings: kopf.OperatorSettings = None, **_) -> kopf.ConnectionInfo:
+    """Kopf's credentials for the MANAGEMENT cluster, read straight from the SA mount.
+
+    Registering any @kopf.on.login() handler makes Kopf skip ALL of its built-in
+    fallbacks (login_via_pykube / login_via_client / ...), which are registered with
+    _fallback=True. That is the point: login_via_client re-reads the shared default
+    `kubernetes.client.Configuration` singleton and, on kopf<=1.44.5 with
+    kubernetes>=36.0.2, looks up the bearer token under the wrong api_key entry and
+    silently yields token=None -> every request goes out as system:anonymous.
+    See agent_reconciler/auth.py for the full write-up.
+
+    `settings` defaults to None so this can be called by hand for diagnosis:
+        kubectl exec deploy/agent-reconciler -- \
+            python -c "from agent_reconciler.operator import login; print(login())"
+    """
+    trust_env = bool(settings.networking.trust_env) if settings is not None else False
+    conn = auth.service_account_connection(trust_env=trust_env)
+    log.warning("kopf will authenticate to %s as the mounted ServiceAccount "
+                "(scheme=%s, token=%d chars)", conn.server, conn.scheme, len(conn.token))
+    return conn
+
+
 @kopf.on.startup()
 async def startup(settings: kopf.OperatorSettings, **_):
     # Keep v0 quiet on the K8s event stream — it's a detector, not an actor.
     settings.posting.level = logging.WARNING
+
+    # Kopf's connection is separate from the two clients below; check it separately.
+    _assert_kopf_login_is_explicit()
+
     _state["mgmt"] = clients.mgmt_api()
     _state["kv"] = clients.kubevirt_api(config.KUBEVIRT_KUBECONFIG)
 
