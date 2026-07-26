@@ -1,8 +1,14 @@
-# Pinned deliberately. kubernetes >=36.0.2 moved the bearer token from the
-# api_key key 'authorization' to 'BearerToken'. Older kopf releases only read
-# 'authorization', so they extract an empty token and every request goes out
-# unauthenticated -> the API server reports User "system:anonymous".
-# kopf >=1.38 reads BearerToken first, then falls back. Keep these compatible.
-kopf>=1.38,<2
+# Pinned deliberately -- this pair caused a multi-day "system:anonymous" outage.
+#
+# kubernetes >=36.0.2 stores the in-cluster bearer token under api_key['BearerToken'].
+# kopf's sync fallback login (login_via_client) read only api_key['authorization']
+# until 1.44.6, so it extracted token=None and every request Kopf made went out
+# unauthenticated -> the API server reported User "system:anonymous".
+#
+# 1.44.6 is the FIRST kopf release whose sync path tries 'BearerToken' then falls back
+# to 'authorization'. Do not lower this floor. (1.44.5 does NOT have it, despite the
+# fix being visible on master -- that one-patch-version gap is what made this so slow
+# to find.) agent_reconciler/auth.py additionally bypasses that code path entirely.
+kopf>=1.44.6,<2
 kubernetes>=29.0,<37
 prometheus-client>=0.20
