@@ -28,6 +28,7 @@ credential path off the shared `Configuration` singleton entirely, so the operat
 longer depends on which library pair the resolver happens to pick at build time, nor on
 any other code in this process mutating that global.
 """
+import dataclasses
 import os
 
 import kopf
@@ -86,11 +87,19 @@ def service_account_connection(
         with open(ns_path, encoding="utf-8") as f:
             namespace = f.read().strip() or None
 
-    return kopf.ConnectionInfo(
+    kwargs = dict(
         server=f"https://{host}:{port}",
         ca_path=ca_path if os.path.exists(ca_path) else None,
         scheme="Bearer",
         token=token,
         default_namespace=namespace,
-        trust_env=trust_env,
     )
+
+    # `trust_env` only exists on ConnectionInfo since kopf 1.44.2. Passing it
+    # unconditionally would TypeError on older releases, which is the difference
+    # between this module working back to ~1.38 and only working on the newest few.
+    # The auth fields above -- the ones that actually matter -- are ancient and stable.
+    if any(f.name == "trust_env" for f in dataclasses.fields(kopf.ConnectionInfo)):
+        kwargs["trust_env"] = trust_env
+
+    return kopf.ConnectionInfo(**kwargs)

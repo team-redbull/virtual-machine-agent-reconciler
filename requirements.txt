@@ -5,10 +5,11 @@
 # until 1.44.6, so it extracted token=None and every request Kopf made went out
 # unauthenticated -> the API server reported User "system:anonymous".
 #
-# 1.44.6 is the FIRST kopf release whose sync path tries 'BearerToken' then falls back
-# to 'authorization'. Do not lower this floor. (1.44.5 does NOT have it, despite the
-# fix being visible on master -- that one-patch-version gap is what made this so slow
-# to find.) agent_reconciler/auth.py additionally bypasses that code path entirely.
-kopf>=1.44.6,<2
+# The floor below is NOT 1.44.6, because agent_reconciler/auth.py registers an explicit
+# @kopf.on.login() handler that bypasses login_via_client entirely -- the operator does
+# not depend on that upstream fix. 1.44.6 is still preferred (it removes the hazard at
+# the source); the wider range is kept so this pin can resolve in air-gapped or mirrored
+# environments. Verified green on 1.38.0 / 1.40.1 / 1.42.5 / 1.44.1 / 1.44.5 / 1.44.6.
+kopf>=1.38,<2
 kubernetes>=29.0,<37
 prometheus-client>=0.20

@@ -120,37 +120,56 @@ def _vm_inventory_filter(meta, **_) -> bool:
 
 @kopf.timer("agent-install.openshift.io", "v1beta1", "agents",
             interval=config.CHECK_INTERVAL, sharp=True, when=_vm_inventory_filter)
-def check_orphan(name: str, namespace: str, meta: dict, logger, **_):
-    """Per-Agent: is this Agent's VM confirmed absent in KubeVirt?"""
+def check_orphan(name: str, namespace: str, body: dict, logger, **_):
+    """Per-Agent: is this Agent's VM confirmed absent in KubeVirt?
+
+    Takes `body` rather than `meta` so the hostname can be read out of
+    spec/status. An Agent's metadata.name is the discovery-ISO UUID, which is
+    unreadable in logs -- every line below leads with the hostname instead.
+    """
     label = config.VM_ID_LABEL
     key = (namespace, name)
-    vid = (meta.get("labels") or {}).get(label)
+    who = detect.agent_ident(body, label)
+    vid = detect.agent_vm_id(body, label)
 
     if not vid:
-        logger.warning("agent %s/%s has no %s label — cannot map to a VM", namespace, name, label)
+        logger.warning("%s | SKIP: no %s label, cannot map this Agent to a VM", who, label)
         return
+
+    logger.info("%s | checking KubeVirt for VirtualMachines matching %s=%s", who, label, vid)
 
     try:
         vms = clients.list_vms(_state["kv"], label_selector=f"{label}={vid}")
     except Exception as e:
         # CRITICAL SAFETY RULE: unreachable/error != absent. Skip, do NOT count.
-        logger.warning("kubevirt query failed for %s/%s (vm-id=%s): %s — skipping, not counting",
-                       namespace, name, vid, e)
+        logger.warning("%s | KubeVirt query FAILED (%s: %s) — skipping this tick, NOT counting "
+                       "as absent (miss streak stays at %d)",
+                       who, type(e).__name__, e, _miss.get(key, 0))
         return
 
     if vms:
-        _miss.pop(key, None)  # VM present — reset any streak
+        found = ", ".join(detect.vm_ident(vm) for vm in vms)
+        previous = _miss.pop(key, 0)  # VM present — reset any streak
+        if previous:
+            logger.warning("%s | VM REAPPEARED: found %d VM(s) [%s] — miss streak reset from %d "
+                           "to 0 (this is why the threshold exists)",
+                           who, len(vms), found, previous)
+        else:
+            logger.info("%s | OK: backing VM present [%s]", who, found)
         return
 
     # Confirmed absent: the API answered and returned zero matches.
     _miss[key] = _miss.get(key, 0) + 1
     n = _miss[key]
     if n >= config.MISS_THRESHOLD:
-        logger.error("ORPHAN CANDIDATE: agent %s/%s vm-id=%s absent for %d consecutive checks "
-                     "(v1 would delete Agent + BMH here)", namespace, name, vid, n)
+        logger.error("%s | ORPHAN CANDIDATE: no VirtualMachine with %s=%s for %d consecutive "
+                     "checks (threshold %d, every %ds) — v1 WOULD DELETE this Agent and its "
+                     "BaremetalHost here; v0 only logs",
+                     who, label, vid, n, config.MISS_THRESHOLD, config.CHECK_INTERVAL)
     else:
-        logger.warning("agent %s/%s vm-id=%s absent (%d/%d) — below threshold, waiting",
-                       namespace, name, vid, n, config.MISS_THRESHOLD)
+        logger.warning("%s | ABSENT %d/%d: no VirtualMachine with %s=%s — below threshold, "
+                       "waiting (could still be a mid-recreation)",
+                       who, n, config.MISS_THRESHOLD, label, vid)
 
     ORPHAN_CANDIDATES.set(sum(1 for c in _miss.values() if c >= config.MISS_THRESHOLD))
 
@@ -167,16 +186,44 @@ async def _skew_loop():
 def _skew_pass():
     """Global: group bound agents by cluster, count their VMIs per node."""
     label = config.VM_ID_LABEL
-    agents = [a for a in clients.list_agents(_state["mgmt"])
+    all_agents = clients.list_agents(_state["mgmt"])
+    agents = [a for a in all_agents
               if detect.is_managed_inventory(a, config.INFRAENV_LABEL,
                                              config.INVENTORY_NAME_FILTER)]
     vmis = clients.list_vmis(_state["kv"])
     vmi_nodes = detect.vmi_nodes_by_vm_id(vmis, label)
 
-    for cluster, node_counts in detect.cluster_node_skew(agents, vmi_nodes, label).items():
+    log.info("SKEW SWEEP: %d Agent(s) on mgmt, %d in a managed inventory (%r on %s); "
+             "%d VMI(s) on kubevirt, %d of them carrying %s",
+             len(all_agents), len(agents), config.INVENTORY_NAME_FILTER,
+             config.INFRAENV_LABEL, len(vmis), len(vmi_nodes), label)
+
+    # vm-id -> readable Agent hostname, so the per-node breakdown can name hosts
+    # instead of echoing opaque vm-id values back at the reader.
+    host_by_vm_id = {}
+    for a in agents:
+        vid = detect.agent_vm_id(a, label)
+        if vid:
+            host_by_vm_id[vid] = detect.agent_hostname(a) or (a.get("metadata") or {}).get("name")
+
+    skew = detect.cluster_node_skew(agents, vmi_nodes, label)
+    if not skew:
+        log.info("SKEW SWEEP: no bound+labelled Agents with a running VMI — nothing to compare")
+
+    for cluster, node_counts in skew.items():
         cname = f"{cluster[0]}/{cluster[1]}"
         node, count = node_counts.most_common(1)[0]
         CLUSTER_SKEW.labels(cluster=cname).set(count)
+
+        spread = ", ".join(f"{n}={c}" for n, c in node_counts.most_common())
+        log.info("cluster %s | spread across infra nodes: %s (max=%d allowed)",
+                 cname, spread, config.MAX_SKEW)
+
         if count > config.MAX_SKEW:
-            log.error("SKEW: cluster %s has %d VMIs on node %s (max=%d) — "
-                      "v3 would migrate the excess", cname, count, node, config.MAX_SKEW)
+            # Name the actual hosts stacked on the hot node -- that is the list a
+            # human needs to act on, and what v3 would feed to the migration call.
+            crowded = sorted(detect.agent_display_name(a) for a in
+                             detect.agents_on_node(agents, vmi_nodes, label, cluster, node))
+            log.error("SKEW: cluster %s has %d VMIs stacked on node %s (max=%d) — "
+                      "hosts: %s — v3 would live-migrate the excess off this node",
+                      cname, count, node, config.MAX_SKEW, ", ".join(crowded) or "<unknown>")
